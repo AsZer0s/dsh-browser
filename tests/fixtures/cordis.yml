@@ -1,0 +1,8 @@
+- id: test-services
+  name: ./services.mjs
+- id: browser-under-test
+  name: ../../lib/index.js
+  inject: [tools, sessions, connection, webServer]
+  config:
+    actionTimeoutMs: 15000
+    navigationTimeoutMs: 15000

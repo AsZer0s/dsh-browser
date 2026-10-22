@@ -1,0 +1,16 @@
+- insert:
+    - id: dsh-browser
+      name: dsh-browser
+      inject: [tools, sessions, connection, webServer]
+      config:
+        headless: true
+        viewportWidth: 1280
+        viewportHeight: 800
+        actionTimeoutMs: 15000
+        navigationTimeoutMs: 30000
+        maxSessions: 8
+        maxPagesPerSession: 8
+        maxSnapshotChars: 24000
+        frameIntervalMs: 1200
+        jpegQuality: 65
+        humanControlLeaseMs: 30000

@@ -1,0 +1,26 @@
+# Dependencies
+node_modules/
+
+# Generated bundles (npm run build / npm pack)
+/lib/
+/client.js
+*.tgz
+*.tsbuildinfo
+
+# Test output
+/test-results/
+/playwright-report/
+/coverage/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and editor/OS files
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+*.swp
+*.swo
