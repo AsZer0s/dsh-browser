@@ -68,13 +68,59 @@ test('redirects to the DSH origin are blocked in the network executor', async t 
   assert.match((await owner.command('a', { action: 'navigate', url }, signal)).text, /Browser fixture/)
 })
 
-test('connection resets retry safe requests only and retain the real cause on exhaustion', async t => {
+test('native redirects retain final URL, relative resources, cookies, POST semantics and popup restrictions', async t => {
+  const hits = []
+  let forbidden = 0
+  const blocked = createServer((req, res) => { forbidden++; res.end('MUST NOT REACH') })
+  blocked.listen(0, '127.0.0.1')
+  await once(blocked, 'listening')
+  const denied = `http://127.0.0.1:${blocked.address().port}`
+  const server = createServer((req, res) => {
+    hits.push({ method: req.method, url: req.url, cookie: req.headers.cookie })
+    if (req.url === '/start') { res.writeHead(302, { location: '/nested/final', 'set-cookie': 'redirected=yes; Path=/' }); res.end(); return }
+    if (req.url === '/post') { res.writeHead(307, { location: '/nested/final' }); res.end(); return }
+    if (req.url === '/deny') { res.writeHead(302, { location: '/deny-again' }); res.end(); return }
+    if (req.url === '/deny-again') { res.writeHead(302, { location: denied }); res.end(); return }
+    if (req.url === '/nested/relative.js') { res.setHeader('content-type', 'text/javascript'); res.end('document.querySelector("#relative").textContent="Relative loaded"'); return }
+    res.setHeader('content-type', 'text/html')
+    res.end('<title>Native redirect</title><p id="relative">Waiting</p><script src="relative.js"></script><form action="/post" method="POST"><input name="value" value="keep"><button>Post</button></form><a href="/deny" target="_blank">Popup denied</a><a href="/start" target="_blank">Popup allowed</a><iframe src="/deny"></iframe>')
+  })
+  server.listen(0, '127.0.0.1')
+  await once(server, 'listening')
+  const owner = new BrowserOwner(configSchema.parse({}), denied)
+  const url = `http://127.0.0.1:${server.address().port}`
+  const signal = new AbortController().signal
+  t.after(async () => { await owner.dispose(); for (const s of [server, blocked]) { s.closeAllConnections(); await new Promise(resolve => s.close(resolve)) } })
+  const result = await owner.command('a', { action: 'navigate', url: `${url}/start` }, signal)
+  assert.match(result.text, /URL: .*\/nested\/final/)
+  assert.match(result.text, /Relative loaded/)
+  assert.ok(hits.some(hit => hit.url === '/nested/final' && hit.cookie?.includes('redirected=yes')))
+  const page = owner.sessions.get('a').page
+  const allowedReady = page.waitForEvent('popup')
+  await page.getByRole('link', { name: 'Popup allowed' }).click()
+  const allowed = await allowedReady
+  await allowed.waitForLoadState('domcontentloaded')
+  // Early popup requests have a documented fail-closed proxy fallback until
+  // Chromium exposes their target. Normal tab navigation is native above.
+  assert.ok([`${url}/start`, `${url}/nested/final`].includes(allowed.url()))
+  await allowed.close()
+  await page.getByRole('button', { name: 'Post', exact: true }).click()
+  assert.ok(hits.some(hit => hit.url === '/nested/final' && hit.method === 'POST'))
+  const popupReady = page.waitForEvent('popup')
+  await page.getByRole('link', { name: 'Popup denied' }).click()
+  const popup = await popupReady
+  await popup.waitForLoadState('domcontentloaded').catch(() => {})
+  assert.equal(forbidden, 0, 'neither popup nor iframe redirect reaches the protected listener')
+})
+
+test('native network failures retain their cause and never replay form submissions', async t => {
   const counts = new Map()
   const server = createServer((req, res) => {
     const key = `${req.method} ${req.url}`
     const count = (counts.get(key) ?? 0) + 1
     counts.set(key, count)
-    if ((req.url === '/once' && count === 1) || (req.url === '/twice' && count <= 2) || req.url === '/post') {
+    if (req.url === '/post') { res.writeHead(200, { 'content-length': '1000' }); res.write('partial'); setTimeout(() => res.destroy(), 20); return }
+    if ((req.url === '/once' && count === 1) || (req.url === '/twice' && count <= 2)) {
       req.socket.destroy()
       return
     }
@@ -91,7 +137,7 @@ test('connection resets retry safe requests only and retain the real cause on ex
   assert.match((await owner.command('a', { action: 'navigate', url: `${url}/redirect` }, signal)).text, /Connection recovered/)
   assert.equal(counts.get('GET /once'), 2, 'redirect hop retries a single connection reset')
   await assert.rejects(owner.command('a', { action: 'navigate', url: `${url}/twice` }, signal), error => {
-    assert.match(error.message, /Browser request failed:.*(?:ECONNRESET|socket hang up)/)
+    assert.match(error.message, /Browser request failed:.*net::ERR_/)
     assert.doesNotMatch(error.message, /BLOCKED_BY_CLIENT|policy|Call log|cookie:/i)
     return true
   })

@@ -6,6 +6,7 @@ export class RealtimeFrames {
   private latest?: { image: string; sequence: number }
   private sequence = 0
   private stopped = false
+  cursor = 'default'
   private readonly listeners = new Set<() => void>()
   private readonly onPageClose = (): void => this.finish()
 
@@ -60,6 +61,21 @@ export class RealtimeFrames {
   private finish(): void {
     this.stopped = true
     for (const notify of this.listeners) notify()
+  }
+
+  async updateCursor(x: number, y: number): Promise<void> {
+    try {
+      const node = await this.cdp.send('DOM.getNodeForLocation', { x, y, includeUserAgentShadowDOM: true })
+      await this.cdp.send('DOM.enable')
+      await this.cdp.send('CSS.enable')
+      await this.cdp.send('DOM.getDocument')
+      const { nodeIds } = await this.cdp.send('DOM.pushNodesByBackendIdsToFrontend', { backendNodeIds: [node.backendNodeId] })
+      if (!nodeIds[0]) return
+      const style = await this.cdp.send('CSS.getComputedStyleForNode', { nodeId: nodeIds[0] })
+      const cursor = style.computedStyle.find(row => row.name === 'cursor')?.value ?? 'default'
+      const next = /^(default|pointer|text|vertical-text|grab|grabbing|crosshair|move|not-allowed|wait|progress|help|[nesw-]+resize|col-resize|row-resize|zoom-in|zoom-out|none)$/.test(cursor) ? cursor : 'default'
+      if (next !== this.cursor) { this.cursor = next; for (const notify of this.listeners) notify() }
+    } catch { this.cursor = 'default' }
   }
 
   async stop(): Promise<void> {

@@ -103,6 +103,10 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
           if (!request.clientId || !request.input || request.command) throw new Error('Physical input requires clientId and input.')
           await owner.input(request.sessionId, request.clientId, request.input, signal)
           return { ok: true, value: {} }
+        case 'pause':
+          if (!request.clientId || request.command || request.input) throw new Error('Pause requires a view identity.')
+          await owner.pause(request.sessionId, request.clientId, signal)
+          return { ok: true, value: {} }
         case 'control':
           if (!request.clientId || request.take === undefined || request.command) throw new Error('Control requests require clientId and take, without a command.')
           return { ok: true, value: await owner.control(request.sessionId, request.clientId, request.take, signal) }
@@ -120,7 +124,7 @@ export function apply(ctx: PluginContext, rawConfig: unknown): void {
   // Exact /api routes inherit Connection's authentication, owner-only admission,
   // request cap, and desktop transport. Do not register a separate RPC channel:
   // that service's registration context does not own webServer injection.
-  for (const endpoint of ['frame', 'command', 'control', 'input']) {
+  for (const endpoint of ['frame', 'command', 'control', 'input', 'pause']) {
     ctx.connection.fetch.register({
       path: `/api/dsh-browser/${endpoint}`, methods: ['POST'], requestBody: 'buffered',
       async fetch(request) {

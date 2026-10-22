@@ -11,6 +11,10 @@ import { configSchema } from '../src/config.ts'
 test('real React sidebar shows the same page that user gestures and AI commands modify', { timeout: 30000 }, async t => {
   const owner = new BrowserOwner(configSchema.parse({ frameIntervalMs: 10000 }), 'http://127.0.0.1:3080')
   const signal = new AbortController().signal
+  let offline = false
+  let stalled = false
+  let frameRequests = 0
+  const textRequests = []
   const client = await readFile(new URL('../client.js', import.meta.url), 'utf8')
   const react = await build({
     stdin: { contents: `import * as React from 'react'; import {createRoot} from 'react-dom/client'; window.React = React; window.createRoot = createRoot;`, resolveDir: process.cwd() },
@@ -24,7 +28,10 @@ test('real React sidebar shows the same page that user gestures and AI commands 
         const chunks = []
         for await (const chunk of req) chunks.push(chunk)
         const { endpoint, payload } = JSON.parse(Buffer.concat(chunks).toString())
-        const value = endpoint === 'frame' ? await owner.frame(payload.sessionId, signal, payload.clientId, payload.after, payload.streamId) : endpoint === 'input' ? await owner.input(payload.sessionId, payload.clientId, payload.input, signal) : endpoint === 'control' ? await owner.control(payload.sessionId, payload.clientId, payload.take, signal) : await owner.command(payload.sessionId, payload.command, signal, { kind: 'human', clientId: payload.clientId })
+        if (endpoint === 'frame') { frameRequests++; if (offline) throw new Error('Simulated disconnect') }
+        if (endpoint === 'frame' && stalled) return // Connected socket, no heartbeat.
+        if (payload.command?.action === 'type') textRequests.push(payload.command.text)
+        const value = endpoint === 'frame' ? await owner.frame(payload.sessionId, signal, payload.clientId, payload.after, payload.streamId) : endpoint === 'pause' ? await owner.pause(payload.sessionId, payload.clientId, signal) : endpoint === 'input' ? await owner.input(payload.sessionId, payload.clientId, payload.input, signal) : endpoint === 'control' ? await owner.control(payload.sessionId, payload.clientId, payload.take, signal) : await owner.command(payload.sessionId, payload.command, signal, { kind: 'human', clientId: payload.clientId })
         res.setHeader('content-type', 'application/json'); res.end(JSON.stringify({ ok: true, value })); return
       }
       if (req.url === '/target') {
@@ -49,6 +56,7 @@ test('real React sidebar shows the same page that user gestures and AI commands 
   const browser = await chromium.launch()
   t.after(async () => { await browser.close(); await owner.dispose(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve)) })
   const page = await browser.newPage({ viewport: { width: 760, height: 1000 } })
+  page.on('pageerror', error => console.error('UI ERROR:', error.message))
   await page.goto(`http://127.0.0.1:${server.address().port}/`)
   await page.evaluate(() => {
     window.__ModuleLoader__ = { load(row) { window.browserPlugin = row.factory(() => window.React) } }
@@ -69,8 +77,8 @@ test('real React sidebar shows the same page that user gestures and AI commands 
         register(spec, Component) { Body = Component; injected = spec.inject('ui-session'); return () => {} },
       },
       resources: { register(value) { provider = value; return () => {} } },
-      connection: { rpc: { async call(_channel, endpoint, payload) {
-        return (await fetch('/rpc', { method: 'POST', body: JSON.stringify({ endpoint: endpoint.split('/').pop(), payload }) })).json()
+      connection: { rpc: { async call(_channel, endpoint, payload, signal) {
+        return (await fetch('/rpc', { method: 'POST', signal, body: JSON.stringify({ endpoint: endpoint.split('/').pop(), payload }) })).json()
       } } },
     }
     window.browserPlugin.apply(ctx)
@@ -127,6 +135,29 @@ test('real React sidebar shows the same page that user gestures and AI commands 
   await image.press('a')
   const target = owner.sessions.get('ui-session').page
   await target.waitForFunction(() => document.querySelector('#name').value === 'a')
+  await image.click({ position: { x: 60 * imageRect.width / 1280, y: 15 * imageRect.width / 1280 } })
+  const sink = page.getByRole('textbox', { name: 'Page keyboard input' })
+  await page.waitForTimeout(450)
+  await target.locator('#name').press('End')
+  await page.keyboard.insertText('bcdef')
+  await target.waitForFunction(() => document.querySelector('#name').value === 'abcdef')
+  assert.ok(textRequests.includes('bcdef'), 'committed text is sent as a batch')
+  await sink.evaluate(element => {
+    element.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true }))
+    element.value = '中文输入'
+    element.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertCompositionText', data: '中文输入', isComposing: true }))
+  })
+  assert.equal(await target.locator('#name').inputValue(), 'abcdef', 'uncommitted IME text is not sent')
+  await sink.evaluate(element => element.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, data: '中文输入' })))
+  await target.waitForFunction(() => document.querySelector('#name').value === 'abcdef中文输入')
+  await sink.evaluate(element => {
+    const clipboardData = new DataTransfer()
+    clipboardData.setData('text/plain', '粘贴文字')
+    element.dispatchEvent(new ClipboardEvent('paste', { bubbles: true, clipboardData }))
+  })
+  await target.waitForFunction(() => document.querySelector('#name').value.endsWith('粘贴文字'))
+  await image.hover({ position: { x: 60 * imageRect.width / 1280, y: 15 * imageRect.width / 1280 } })
+  await page.waitForFunction(() => getComputedStyle(document.querySelector('.dsb-image')).cursor === 'text')
   await target.locator('#name').fill('')
   // Hold and move without releasing: both the remote page and the visible
   // compositor frame must change before pointerup (unlike endpoint-only drag).
@@ -170,6 +201,37 @@ test('real React sidebar shows the same page that user gestures and AI commands 
   assert.match(await image.getAttribute('src'), /^data:image\/jpeg;base64,/)
   await page.getByRole('button', { name: 'Take control', exact: true }).click()
   await page.waitForFunction(() => !document.querySelector('.dsb-address input').disabled)
+  offline = true
+  await page.getByText('Disconnected', { exact: true }).waitFor()
+  assert.equal(await addressInput.isDisabled(), true)
+  offline = false
+  await page.getByRole('button', { name: 'Confirm control', exact: true }).waitFor()
+  assert.equal(await addressInput.isDisabled(), true, 'reconnect must not silently re-enable ownership')
+  await page.getByRole('button', { name: 'Confirm control', exact: true }).click()
+  await page.waitForFunction(() => !document.querySelector('.dsb-address input').disabled)
+  stalled = true
+  await page.getByText('Disconnected', { exact: true }).waitFor({ timeout: 9000 })
+  assert.equal(await addressInput.isDisabled(), true, 'a stalled connection expires even without a network error')
+  stalled = false
+  await page.getByRole('button', { name: 'Confirm control', exact: true }).waitFor()
+  await page.getByRole('button', { name: 'Confirm control', exact: true }).click()
+  await page.waitForFunction(() => !document.querySelector('.dsb-address input').disabled)
+  await page.locator('#root').evaluate(root => { root.style.display = 'none' })
+  await page.waitForTimeout(1300)
+  const hiddenRequests = frameRequests
+  await page.waitForTimeout(1300)
+  assert.equal(frameRequests, hiddenRequests, 'hidden panels stop polling')
+  assert.equal(owner.sessions.get('ui-session').controlledBy, undefined)
+  assert.equal(owner.sessions.get('ui-session').stream, undefined)
+  await page.locator('#root').evaluate(root => { root.style.display = '' })
+  await page.getByRole('button', { name: 'Take control', exact: true }).click()
+  await page.waitForFunction(() => !document.querySelector('.dsb-address input').disabled)
+  await page.getByLabel('More actions', { exact: true }).click()
+  page.once('dialog', dialog => dialog.dismiss())
+  await page.getByRole('button', { name: 'Close browser', exact: true }).click()
+  assert.equal((await owner.frame('ui-session', signal)).active, true, 'cancel keeps the browser alive')
+  await page.getByLabel('More actions', { exact: true }).click()
+  page.once('dialog', dialog => dialog.accept())
   await page.getByRole('button', { name: 'Close browser', exact: true }).click()
   await page.getByText('Let AI open a page for you', { exact: true }).waitFor()
   assert.equal((await owner.frame('ui-session', signal)).active, false)

@@ -19,7 +19,7 @@ test('published client mounts reversible tab, copy, resource, and body contribut
         return { createElement: (type, props, ...children) => ({ type, props, children }), useState: value => [typeof value === 'function' ? value() : value, () => {}], useRef: value => ({ current: value }), useEffect: () => {} }
       })
     } } },
-    URL, setTimeout, clearTimeout, crypto,
+    URL, setTimeout, clearTimeout, crypto, AbortController,
     document: { createElement: () => ({ remove() {} }), head: { append() {} } },
   }
   vm.runInNewContext(await readFile(new URL('../client.js', import.meta.url), 'utf8'), sandbox)

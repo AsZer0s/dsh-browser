@@ -1,6 +1,6 @@
 {
   "name": "dsh-browser",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "AI-controlled sidebar browser for DeepSeek Harness with per-session isolation, live human takeover, and real-time pointer input.",
   "license": "MIT",
   "type": "module",

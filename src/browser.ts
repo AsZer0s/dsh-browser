@@ -2,6 +2,7 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Request } from 'playwright'
 import type { BrowserCommand, BrowserConfig, HumanInput } from './config.ts'
 import { RealtimeFrames } from './realtime.ts'
+import { guardNetwork } from './network.ts'
 
 interface SessionBrowser {
   context?: BrowserContext
@@ -28,6 +29,8 @@ export interface BrowserFrame {
   controlledBy: string | null
   streamId?: string
   sequence?: number
+  cursor?: string
+  receivedAt?: number
   tabs: { index: number; title: string; url: string; selected: boolean }[]
 }
 
@@ -67,6 +70,7 @@ export class BrowserOwner {
   private browser?: Promise<Browser>
   private readonly sessions = new Map<string, SessionBrowser>()
   private readonly requestErrors = new WeakMap<Request, Error>()
+  private networkReady?: () => Promise<void>
   private closed = false
   private readonly config: BrowserConfig
   private readonly applicationOrigin: string
@@ -140,6 +144,9 @@ export class BrowserOwner {
         headless: this.config.headless,
         ...(this.config.executablePath ? { executablePath: this.config.executablePath } : {}),
         ...(this.config.channel ? { channel: this.config.channel } : {}),
+      }).then(async browser => {
+        try { this.networkReady = await guardNetwork(browser, url => { browserUrl(url, this.applicationOrigin) }); return browser }
+        catch (error) { await browser.close(); throw error }
       })
       void this.browser.catch(() => { this.browser = undefined })
     }
@@ -157,51 +164,56 @@ export class BrowserOwner {
     }
     context.setDefaultTimeout(this.config.actionTimeoutMs)
     context.setDefaultNavigationTimeout(this.config.navigationTimeoutMs)
-    let contextClosed = false
-    context.on('close', () => { contextClosed = true })
     await context.route('**/*', async route => {
-      // Playwright does not re-route redirect chains; fetch and validate every
-      // hop ourselves and fulfill only the terminal response.
       try {
         browserUrl(route.request().url(), this.applicationOrigin)
-        let url = route.request().url()
-        let method = route.request().method()
-        // Playwright retries ECONNRESET only. Never replay a form submission.
-        let response = await route.fetch({ maxRedirects: 0, maxRetries: method === 'GET' || method === 'HEAD' ? 1 : 0, timeout: this.config.navigationTimeoutMs })
-        try {
-          for (let redirects = 0; ; redirects++) {
-            const location = response.headers()['location']
-            if (response.status() < 300 || response.status() >= 400 || !location) break
-            if (redirects >= 20) throw new Error('Too many redirects.')
-            url = browserUrl(new URL(location, response.url()).href, this.applicationOrigin)
-            const status = response.status()
-            if (status === 303 || ((status === 301 || status === 302) && method === 'POST')) method = 'GET'
-            const headers = { ...route.request().headers() }
-            // Never forward credentials or an inherited Origin across redirects.
-            for (const name of ['authorization', 'cookie', 'origin', 'host', 'content-length']) delete headers[name]
-            if (method === 'GET' || method === 'HEAD') delete headers['content-type']
-            await response.dispose()
-            response = await route.fetch({
-              url, method, headers, maxRedirects: 0, maxRetries: method === 'GET' || method === 'HEAD' ? 1 : 0, timeout: this.config.navigationTimeoutMs,
-              ...(method === 'GET' || method === 'HEAD' ? { postData: '' } : {}),
-            })
-          }
-          await route.fulfill({ response })
-        } finally {
-          await response.dispose()
+        // Gate first requests (including popups without a Playwright Frame)
+        // until native CDP interception is active for every current target.
+        await this.networkReady!()
+        // Chromium exposes some popup targets only after their initial load.
+        // Keep this narrow fallback fail-closed until CDP can protect the page.
+        let earlyPopup = false
+        try { route.request().frame() } catch { earlyPopup = true }
+        if (earlyPopup) {
+          let response = await route.fetch({ maxRedirects: 0, maxRetries: 0, timeout: this.config.navigationTimeoutMs })
+          try {
+            for (let hop = 0; ; hop++) {
+              const location = response.headers()['location']
+              if (response.status() < 300 || response.status() >= 400 || !location) break
+              if (hop >= 20) throw new Error('Too many popup redirects.')
+              const url = browserUrl(new URL(location, response.url()).href, this.applicationOrigin)
+              // Do not risk replaying POST data across an early popup chain.
+              if (!['GET', 'HEAD'].includes(route.request().method())) throw new Error('Early popup form redirects are unsupported.')
+              const headers = { ...route.request().headers() }
+              for (const name of ['authorization', 'cookie', 'origin', 'host']) delete headers[name]
+              await response.dispose()
+              response = await route.fetch({ url, headers, maxRedirects: 0, maxRetries: 0, timeout: this.config.navigationTimeoutMs })
+            }
+            await route.fulfill({ response })
+          } finally { await response.dispose() }
+          return
         }
+        await route.continue()
       } catch (error) {
         const blocked = error instanceof BrowserPolicyError
-        // Retain only the first line, not Playwright's header/cookie-rich call log.
-        const detail = String(error instanceof Error ? error.message : error).replace(/\u001b\[[0-9;]*m/g, '').split(/\r?\n/)[0]!.slice(0, 700)
-        const failure = new Error(`${blocked ? 'Browser policy blocked a request' : 'Browser request failed'}: ${detail}`)
-        this.requestErrors.set(route.request(), failure)
-        if (!contextClosed && !entry.closing && !this.closed) console.warn('dsh-browser:', failure.message)
-        // Connection failures are not policy denials. Always settle the route.
-        await route.abort(blocked ? 'blockedbyclient' : 'failed').catch(abortError => {
-          console.warn('dsh-browser: request ended before abort completed', abortError)
-        })
+        const detail = String(error instanceof Error ? error.message : error).split(/\r?\n/)[0]!.slice(0, 700)
+        this.requestErrors.set(route.request(), new Error(`${blocked ? 'Browser policy blocked a request' : 'Browser request failed'}: ${detail}`))
+        await route.abort(blocked ? 'blockedbyclient' : 'failed').catch(() => {})
       }
+    })
+    context.on('requestfailed', request => {
+      if (this.requestErrors.has(request)) return
+      let detail = request.failure()?.errorText ?? 'Unknown network error'
+      let blocked = false
+      if (detail.includes('ERR_BLOCKED_BY_CLIENT')) {
+        blocked = true
+        detail = 'Opening the DSH application or a disallowed URL in the controlled browser is not allowed.'
+      }
+      try { browserUrl(request.url(), this.applicationOrigin) } catch (error) {
+        blocked = true
+        detail = error instanceof Error ? error.message : String(error)
+      }
+      this.requestErrors.set(request, new Error(`${blocked ? 'Browser policy blocked a request' : 'Browser request failed'}: ${detail}`))
     })
     context.on('page', page => {
       if (context.pages().length > this.config.maxPagesPerSession) {
@@ -410,6 +422,7 @@ export class BrowserOwner {
         await page.mouse.down({ button: entry.pressed.button, clickCount: input.clickCount ?? 1 })
       } else if (input.type === 'move') {
         await page.mouse.move(position.x, position.y)
+        if (entry.stream) await entry.stream.updateCursor(position.x, position.y)
         if (entry.pressed) entry.pressed.timer.refresh()
       } else {
         await page.mouse.move(position.x, position.y)
@@ -479,7 +492,22 @@ export class BrowserOwner {
     // Waiting for a compositor frame must not hold up mouse input or AI reads.
     const image = await stream.next(streamId === stream.id ? after : 0, signal)
     if (entry.stream !== stream || entry.controlledBy !== result.controlledBy) return { ...result, image: '', controlledBy: entry.controlledBy ?? null, intervalMs: 0 }
-    return { ...result, image: image?.image ?? '', sequence: image?.sequence ?? 0, streamId: stream.id, intervalMs: 0 }
+    return { ...result, image: image?.image ?? '', sequence: image?.sequence ?? 0, cursor: stream.cursor, streamId: stream.id, intervalMs: 0 }
+  }
+
+  /** Hidden views release ownership and stop encoding instead of polling forever. */
+  async pause(id: string, clientId: string, signal: AbortSignal): Promise<void> {
+    const entry = this.sessions.get(id)
+    if (!entry) return
+    await this.enqueue(entry, signal, async () => {
+      if (entry.controlledBy === clientId) {
+        entry.controlledBy = undefined
+        entry.controlledUntil = undefined
+        clearTimeout(entry.leaseTimer)
+        await this.releasePointer(entry)
+        await this.stopStream(entry)
+      }
+    }, false)
   }
 
   /** Stop admission, close the context, and await the Session's pending operations. */
